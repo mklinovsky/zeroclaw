@@ -1,0 +1,106 @@
+name: Debian Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Image revision; the tag is <Cargo.toml version>-<revision>, e.g. 0.8.5-1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  image:
+    name: Build and push linux/amd64 Debian image
+    # Same runner as the release's x86_64 leg, so the binary links against glibc 2.35.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve image tag
+        id: tag
+        shell: bash
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" =~ ^[0-9]+$ ]] || { echo "::error::revision must be a number, got: $REVISION"; exit 1; }
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          owner=$(tr '[:upper:]' '[:lower:]' <<<"${{ github.repository_owner }}")
+          echo "image=ghcr.io/${owner}/zeroclaw:${version}-${REVISION}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing tag
+        env:
+          IMAGE: ${{ steps.tag.outputs.image }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::$IMAGE already exists; use a new revision"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: debian-image-${{ env.TARGET }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cargo web build
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "$TARGET")"
+          echo "Resolved features: $FEATURES"
+          cargo build --release --locked --no-default-features --features "${FEATURES}" --target "$TARGET"
+          cargo build --release --locked -p zerocode --target "$TARGET"
+
+      - name: Prepare Docker context
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The from-artifacts mode needs both architectures; smoke mode writes the
+          # same config and Dockerfile, then the amd64 placeholders are replaced.
+          bash scripts/ci/prepare_docker_context.sh smoke docker-ctx
+          rm -rf docker-ctx/bin/amd64
+          mkdir -p docker-ctx/bin/amd64/web
+          cp "target/$TARGET/release/zeroclaw" "target/$TARGET/release/zerocode" docker-ctx/bin/amd64/
+          cp -r web/dist docker-ctx/bin/amd64/web/dist
+          test -f docker-ctx/bin/amd64/web/dist/index.html
+
+      - name: Build and push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile
+          build-args: |
+            VARIANT=debian
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
