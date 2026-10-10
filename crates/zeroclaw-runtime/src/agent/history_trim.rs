@@ -253,6 +253,11 @@ pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
+pub fn is_breadcrumb(message: &ChatMessage) -> bool {
+    let crumb = breadcrumb();
+    message.role == crumb.role && message.content == crumb.content
+}
+
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
 pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {

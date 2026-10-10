@@ -79,9 +79,13 @@ pub(crate) async fn try_recover_context_overflow(
         // pair, never silently shrinks a result. Whole turns or nothing.
         let tokens_now = estimate_history_tokens(history);
         let budget = tokens_now.saturating_mul(2) / 3;
+        let real_messages_before = count_real_messages(history);
         let owned = std::mem::take(history);
         let result = trim_to_recent_turns(owned, budget);
-        let trimmed = result.trimmed;
+        // The breadcrumb inserted by the previous attempt is a user message, so
+        // the trimmer counts it as a turn. Dropping only that is no progress:
+        // re-inserting it and retrying would resend the same request forever.
+        let trimmed = result.trimmed && count_real_messages(&result.history) < real_messages_before;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
         let kept_turns = result.kept_turns;
@@ -168,11 +172,48 @@ pub(crate) async fn try_recover_context_overflow(
     false
 }
 
+fn count_real_messages(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .filter(|message| !crate::agent::history_trim::is_breadcrumb(message))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
+
+    /// A previous attempt left its breadcrumb in front of the single oversized
+    /// turn. Dropping that breadcrumb is the only trim available, and counting
+    /// it as recovery made the agent resend the same request until the turn
+    /// timed out.
+    #[tokio::test]
+    async fn dropping_only_the_previous_breadcrumb_is_not_recovery() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            crate::agent::history_trim::breadcrumb(),
+            ChatMessage::user(format!("only turn {}", "x".repeat(40_000)).as_str()),
+        ];
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let observer = NoopObserver;
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, 32_000)
+                .await;
+
+        assert!(
+            !recovered,
+            "removing only a breadcrumb must end the retries"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(crate::agent::history_trim::is_breadcrumb),
+            "no breadcrumb may be re-inserted when nothing real was dropped"
+        );
+    }
 
     fn overflowing_history() -> Vec<ChatMessage> {
         let big = "x".repeat(4000);
