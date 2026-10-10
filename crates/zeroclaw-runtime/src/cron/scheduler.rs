@@ -864,7 +864,11 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
+            // Type-erased: one more wrapper around the concrete future overflows
+            // the compiler's recursion limit when proving it `Send`.
+            let run: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>,
+            > = Box::pin(
                 crate::agent::run(
                     cron_config,
                     agent_alias,
@@ -882,8 +886,10 @@ async fn run_agent_job(
                     run_overrides,
                 )
                 .instrument(subagent_span),
-            )
-            .await
+            );
+            zeroclaw_api::PROMPT_CACHE_SCOPE
+                .scope(Some(format!("cron:{}:{run_session_id}", job.id)), run)
+                .await
         }
     };
 

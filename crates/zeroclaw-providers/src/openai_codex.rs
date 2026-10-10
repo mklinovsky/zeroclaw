@@ -54,6 +54,8 @@ struct ResponsesRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +235,34 @@ pub(crate) fn first_nonempty(text: Option<&str>) -> Option<String> {
 
 fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
+}
+
+/// The ChatGPT backend reuses a cached prompt prefix reliably only when the
+/// request names its conversation (`session-id` header, `prompt_cache_key`);
+/// without them about half of the follow-up calls in a tool loop miss.
+/// Hashed so channel and user identifiers in the session key are not sent.
+fn current_prompt_cache_key() -> Option<String> {
+    let non_empty = |scope: Option<String>| scope.filter(|s| !s.is_empty());
+    let scope = non_empty(
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
+    )
+    .or_else(|| {
+        non_empty(
+            zeroclaw_api::PROMPT_CACHE_SCOPE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        )
+    })?;
+    Some(prompt_cache_key_for_scope(&scope))
+}
+
+fn prompt_cache_key_for_scope(scope: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(scope.as_bytes())[..16])
 }
 
 pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
@@ -1327,6 +1357,10 @@ impl OpenAiCodexModelProvider {
             request_builder = request_builder.header("accept", "text/event-stream");
         }
 
+        if let Some(key) = request.prompt_cache_key.as_deref() {
+            request_builder = request_builder.header("session-id", key);
+        }
+
         if let Some(account_id) = account_id {
             request_builder = request_builder.header("chatgpt-account-id", account_id);
         }
@@ -1341,6 +1375,14 @@ impl OpenAiCodexModelProvider {
         }
 
         request_builder
+    }
+
+    fn prompt_cache_key(&self) -> Option<String> {
+        // A custom endpoint is not the ChatGPT backend and may reject the extra body field.
+        if self.custom_endpoint {
+            return None;
+        }
+        current_prompt_cache_key()
     }
 
     async fn send_responses_request(
@@ -1375,6 +1417,7 @@ impl OpenAiCodexModelProvider {
             tools,
             tool_choice: has_tools.then(|| "auto".to_string()),
             parallel_tool_calls: has_tools.then_some(true),
+            prompt_cache_key: self.prompt_cache_key(),
         };
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -1389,6 +1432,7 @@ impl OpenAiCodexModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": request.tool_choice.as_deref(),
                         "parallel_tool_calls": request.parallel_tool_calls,
+                        "cache_affinity": request.prompt_cache_key.is_some(),
                     })),
                 "openai codex responses provider request prepared"
             );
@@ -1571,6 +1615,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let tools = request.tools.map(|items| items.to_vec());
         let model = model.to_string();
         let count_tokens = options.count_tokens;
+        // Resolved before the spawn: task-locals do not cross it.
+        let prompt_cache_key = self.prompt_cache_key();
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1621,6 +1667,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 tools,
                 tool_choice: has_tools.then(|| "auto".to_string()),
                 parallel_tool_calls: has_tools.then_some(true),
+                prompt_cache_key,
             };
             if ::zeroclaw_log::debug_enabled() {
                 ::zeroclaw_log::record!(
@@ -1635,6 +1682,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                             "tools_count": tools_count,
                             "tool_choice": request.tool_choice.as_deref(),
                             "parallel_tool_calls": request.parallel_tool_calls,
+                            "cache_affinity": request.prompt_cache_key.is_some(),
                         })),
                     "openai codex responses streaming provider request prepared"
                 );
@@ -1839,6 +1887,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         };
         let request_builder =
             provider.responses_request_builder("test-key", None, None, true, &request);
@@ -2155,6 +2204,144 @@ mod tests {
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
         assert!(provider.custom_endpoint);
         assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
+    }
+
+    fn default_endpoint_provider() -> (OpenAiCodexModelProvider, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        assert!(!provider.custom_endpoint);
+        (provider, temp_dir)
+    }
+
+    fn request_with_cache_key(prompt_cache_key: Option<String>) -> ResponsesRequest {
+        ResponsesRequest {
+            model: "gpt-5".to_string(),
+            input: vec![serde_json::json!({"role": "user", "content": "hello"})],
+            instructions: DEFAULT_CODEX_INSTRUCTIONS.to_string(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            prompt_cache_key,
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_is_stable_per_session_and_hides_the_session_key() {
+        let (provider, _dir) = default_endpoint_provider();
+        let key_for = |session: &str| {
+            zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(Some(session.to_string()), async {
+                provider.prompt_cache_key()
+            })
+        };
+
+        let first = key_for("discord_glokta_123_456").await;
+        let again = key_for("discord_glokta_123_456").await;
+        let other = key_for("discord_glokta_789_456").await;
+
+        let first = first.expect("a session key must produce a cache key");
+        assert_eq!(Some(first.clone()), again);
+        assert_ne!(Some(first.clone()), other);
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_is_absent_outside_any_scope() {
+        let (provider, _dir) = default_endpoint_provider();
+        assert_eq!(provider.prompt_cache_key(), None);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_falls_back_to_the_cache_scope() {
+        let (provider, _dir) = default_endpoint_provider();
+
+        let cron_only = zeroclaw_api::PROMPT_CACHE_SCOPE
+            .scope(Some("cron:job:run".to_string()), async {
+                provider.prompt_cache_key()
+            })
+            .await;
+        assert_eq!(cron_only, Some(prompt_cache_key_for_scope("cron:job:run")));
+
+        let session_wins = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("session".to_string()),
+                zeroclaw_api::PROMPT_CACHE_SCOPE.scope(Some("cron:job:run".to_string()), async {
+                    provider.prompt_cache_key()
+                }),
+            )
+            .await;
+        assert_eq!(session_wins, Some(prompt_cache_key_for_scope("session")));
+
+        let empty_session_falls_through = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some(String::new()),
+                zeroclaw_api::PROMPT_CACHE_SCOPE.scope(Some("cron:job:run".to_string()), async {
+                    provider.prompt_cache_key()
+                }),
+            )
+            .await;
+        assert_eq!(
+            empty_session_falls_through,
+            Some(prompt_cache_key_for_scope("cron:job:run"))
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_sends_no_prompt_cache_key() {
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
+
+        let key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("session".to_string()), async {
+                provider.prompt_cache_key()
+            })
+            .await;
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn prompt_cache_key_is_sent_as_session_id_header_and_body_field() {
+        let (provider, _dir) = default_endpoint_provider();
+
+        let request = request_with_cache_key(Some("abc123".to_string()));
+        let built = provider
+            .responses_request_builder("token", None, None, false, &request)
+            .json(&request)
+            .build()
+            .unwrap();
+        assert_eq!(built.headers().get("session-id").unwrap(), "abc123");
+        let body: serde_json::Value =
+            serde_json::from_slice(built.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["prompt_cache_key"], "abc123");
+
+        let request = request_with_cache_key(None);
+        let built = provider
+            .responses_request_builder("token", None, None, false, &request)
+            .json(&request)
+            .build()
+            .unwrap();
+        assert!(built.headers().get("session-id").is_none());
+        let body: serde_json::Value =
+            serde_json::from_slice(built.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     #[tokio::test]
