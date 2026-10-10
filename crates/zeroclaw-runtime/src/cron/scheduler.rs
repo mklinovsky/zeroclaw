@@ -1259,9 +1259,13 @@ async fn run_agent_job_inner(
         .model_provider_for_agent(agent_alias)
         .and_then(|e| e.temperature);
     let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => match capabilities {
-            Some(capabilities) => {
-                Box::pin(
+        SessionTarget::Main | SessionTarget::Isolated => {
+            // Type-erased: one more wrapper around the concrete future overflows
+            // the compiler's recursion limit when proving it `Send`.
+            let run: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + '_>,
+            > = match capabilities {
+                Some(capabilities) => Box::pin(
                     crate::agent::run_with_capabilities(
                         config.clone(),
                         capabilities.clone(),
@@ -1279,11 +1283,8 @@ async fn run_agent_job_inner(
                         run_overrides,
                     )
                     .instrument(subagent_span),
-                )
-                .await
-            }
-            None => {
-                Box::pin(
+                ),
+                None => Box::pin(
                     crate::agent::run(
                         config.clone(),
                         agent_alias,
@@ -1299,10 +1300,12 @@ async fn run_agent_job_inner(
                         run_overrides,
                     )
                     .instrument(subagent_span),
-                )
+                ),
+            };
+            zeroclaw_api::PROMPT_CACHE_SCOPE
+                .scope(Some(format!("cron:{}:{run_session_id}", job.id)), run)
                 .await
-            }
-        },
+        }
     };
 
     match run_result {
