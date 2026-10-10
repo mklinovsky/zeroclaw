@@ -489,7 +489,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": function_call_output_value(output),
                         }));
                     } else if !msg.content.trim().is_empty() {
                         input.push(legacy_tool_output_message(&msg.content));
@@ -509,6 +509,46 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
     };
 
     (instructions, input)
+}
+
+/// Images loaded into a tool result go out as `input_image` items next to the
+/// text, as the Codex client sends them; inlined in the string they would reach
+/// the model as base64 text. Only loaded (`data:`) markers move; any other
+/// marker is quoted text and stays in place.
+fn function_call_output_value(output: &str) -> Value {
+    let (text, images) = split_inline_image_markers(output);
+    if images.is_empty() {
+        return Value::String(output.to_string());
+    }
+    let mut items = Vec::with_capacity(images.len() + 1);
+    if !text.trim().is_empty() {
+        items.push(serde_json::json!({"type": "input_text", "text": text}));
+    }
+    items.extend(
+        images
+            .into_iter()
+            .map(|image_url| serde_json::json!({"type": "input_image", "image_url": image_url})),
+    );
+    Value::Array(items)
+}
+
+fn split_inline_image_markers(text: &str) -> (String, Vec<String>) {
+    const OPEN: &str = "[IMAGE:data:";
+    let mut remaining = String::with_capacity(text.len());
+    let mut images = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find(OPEN) {
+        let start = cursor + rel;
+        let payload_start = start + "[IMAGE:".len();
+        let Some(len) = text[payload_start..].find(']') else {
+            break;
+        };
+        remaining.push_str(&text[cursor..start]);
+        images.push(text[payload_start..payload_start + len].to_string());
+        cursor = payload_start + len + 1;
+    }
+    remaining.push_str(&text[cursor..]);
+    (remaining.trim().to_string(), images)
 }
 
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
@@ -2919,6 +2959,41 @@ data: [DONE]
         assert_eq!(result.tool_calls[0].id, "call_1");
         assert_eq!(result.tool_calls[0].name, "shell");
         assert_eq!(result.tool_calls[0].arguments, "{\"command\":\"pwd\"}");
+    }
+
+    #[test]
+    fn tool_result_with_loaded_image_becomes_input_image_items() {
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_gen",
+                "content": "saved\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+            })
+            .to_string(),
+        )];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_gen");
+        assert_eq!(
+            input[0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "saved"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_text_and_unloaded_markers_stay_a_string() {
+        let quoted = "docs/guide.md:3:reply with [IMAGE:/workspace/images/a.png]";
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({"tool_call_id": "call_search", "content": quoted}).to_string(),
+        )];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input[0]["output"], quoted);
     }
 
     #[test]

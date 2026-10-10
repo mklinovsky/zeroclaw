@@ -381,20 +381,14 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+    count_image_markers_in_scope(messages, &tool_image_scope(messages))
 }
 
-fn count_image_markers_with_latest_tool_results(
-    messages: &[ChatMessage],
-    latest_tool_result_indices: &HashSet<usize>,
-) -> usize {
+fn count_image_markers_in_scope(messages: &[ChatMessage], scope: &ToolImageScope) -> usize {
     messages
         .iter()
         .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, latest_tool_result_indices)
-        })
+        .filter(|(index, message)| should_normalize_message_images(*index, message, scope))
         .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
 }
@@ -590,13 +584,119 @@ fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
     indices
 }
 
+/// Tools whose results may carry images. Any other tool result is plain text:
+/// a marker in it only quotes marker syntax (a file, a search hit, a log line),
+/// and loading it would attach an unrelated image.
+const IMAGE_RESULT_TOOLS: &[&str] = &["image_gen", "image_info", "screenshot", "browser"];
+
+/// Which tool results take part in image handling.
+struct ToolImageScope {
+    /// Results from image tools in the trailing tool-result run: their images load.
+    loadable: HashSet<usize>,
+    /// Every result from an image tool; older ones get their images stripped.
+    from_image_tools: HashSet<usize>,
+}
+
+fn tool_image_scope(messages: &[ChatMessage]) -> ToolImageScope {
+    let from_image_tools = image_tool_result_indices(messages);
+    let loadable = latest_tool_result_indices(messages)
+        .into_iter()
+        .filter(|index| from_image_tools.contains(index))
+        .collect();
+    ToolImageScope {
+        loadable,
+        from_image_tools,
+    }
+}
+
+fn image_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    let mut indices = HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        match message.role.as_str() {
+            "assistant" => record_tool_call_names(&message.content, &mut call_names),
+            "tool" => {
+                let from_image_tool = match native_tool_result_name(&message.content, &call_names) {
+                    Some(name) => IMAGE_RESULT_TOOLS.contains(&name.as_str()),
+                    None => all_prompt_results_from_image_tools(&message.content),
+                };
+                if from_image_tool {
+                    indices.insert(index);
+                }
+            }
+            _ if is_prompt_tool_result_message(message)
+                && all_prompt_results_from_image_tools(&message.content) =>
+            {
+                indices.insert(index);
+            }
+            _ => {}
+        }
+    }
+    indices
+}
+
+fn record_tool_call_names(content: &str, call_names: &mut HashMap<String, String>) {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return;
+    };
+    let Some(calls) = obj.get("tool_calls").and_then(|calls| calls.as_array()) else {
+        return;
+    };
+    for call in calls {
+        if let (Some(id), Some(name)) = (
+            call.get("id").and_then(|v| v.as_str()),
+            call.get("name").and_then(|v| v.as_str()),
+        ) {
+            call_names.insert(id.to_string(), name.to_string());
+        }
+    }
+}
+
+fn native_tool_result_name(content: &str, call_names: &HashMap<String, String>) -> Option<String> {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return None;
+    };
+    if let Some(name) = obj.get("tool_name").and_then(|v| v.as_str()) {
+        return Some(name.to_string());
+    }
+    let call_id = obj.get("tool_call_id").and_then(|v| v.as_str())?;
+    call_names.get(call_id).cloned()
+}
+
+/// A text tool-result carrier may hold several `<tool_result>` blocks, so it may
+/// attach images only when every block comes from an image tool.
+fn all_prompt_results_from_image_tools(content: &str) -> bool {
+    let names = prompt_tool_result_names(content);
+    !names.is_empty()
+        && names
+            .iter()
+            .all(|name| IMAGE_RESULT_TOOLS.contains(&name.as_str()))
+}
+
+fn prompt_tool_result_names(content: &str) -> Vec<String> {
+    const OPEN: &str = "<tool_result name=\"";
+    let mut names = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = content[from..].find(OPEN) {
+        let start = from + rel + OPEN.len();
+        let Some(len) = content[start..].find('"') else {
+            break;
+        };
+        names.push(content[start..start + len].to_string());
+        from = start + len;
+    }
+    names
+}
+
 fn should_normalize_message_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    scope: &ToolImageScope,
 ) -> bool {
     if is_tool_result_carrier(message) {
-        return latest_tool_result_indices.contains(&index);
+        return scope.loadable.contains(&index);
     }
 
     message.role == "user"
@@ -646,9 +746,12 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 fn replay_message_without_stale_tool_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    scope: &ToolImageScope,
 ) -> ChatMessage {
-    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+    if is_tool_result_carrier(message)
+        && scope.from_image_tools.contains(&index)
+        && !scope.loadable.contains(&index)
+    {
         strip_tool_result_image_markers(message)
     } else {
         message.clone()
@@ -729,8 +832,8 @@ async fn prepare_messages_inner(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let scope = tool_image_scope(messages);
+    let total_images = count_image_markers_in_scope(messages, &scope);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
@@ -738,7 +841,7 @@ async fn prepare_messages_inner(
                 .iter()
                 .enumerate()
                 .map(|(index, message)| {
-                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                    replay_message_without_stale_tool_images(index, message, &scope)
                 })
                 .collect(),
             contains_images: false,
@@ -754,16 +857,13 @@ async fn prepare_messages_inner(
     // prevents conversations from sticking once the cumulative count crosses
     // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
     for (index, message) in messages.iter().enumerate() {
-        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+        if !should_normalize_message_images(index, message, &scope) {
             normalized_messages.push(replay_message_without_stale_tool_images(
-                index,
-                message,
-                &latest_tool_indices,
+                index, message, &scope,
             ));
             continue;
         }
@@ -921,14 +1021,12 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
 /// are dropped, so a message holding more images than the budget allows keeps
 /// its newest ones instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let scope = tool_image_scope(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
-        .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &latest_tool_indices)
-        })
+        .filter(|(index, message)| should_normalize_message_images(*index, message, &scope))
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
             if count > 0 { Some((i, count)) } else { None }
@@ -959,7 +1057,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, m)| {
             let Some(&drop_here) = drop_counts.get(&i) else {
-                return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
+                return replay_message_without_stale_tool_images(i, m, &scope);
             };
 
             trim_message_images(m, drop_here)
@@ -2081,6 +2179,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
+            "tool_name": "image_gen",
             "content": format!("see attached [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
@@ -2126,6 +2225,7 @@ mod tests {
     async fn prepare_messages_preserves_native_tool_json_when_image_is_skipped() {
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
+            "tool_name": "image_gen",
             "content": "generated screenshot [IMAGE:https://example.com/missing.png]",
         })
         .to_string();
@@ -2169,6 +2269,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
+            "tool_name": "image_gen",
             "content": format!(
                 "generated [IMAGE:{}] and [IMAGE:https://example.com/missing.png]",
                 image_path.display()
@@ -2216,6 +2317,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
+            "tool_name": "image_gen",
             "content": format!("generated screenshot [IMAGE:{}]", image_path.display().to_string()),
         })
         .to_string();
@@ -2304,6 +2406,7 @@ mod tests {
 
         let native_tool_content = serde_json::json!({
             "tool_call_id": "tc1",
+            "tool_name": "image_gen",
             "content": format!("generated screenshot [IMAGE:{}]", stale_path.display().to_string()),
         })
         .to_string();
@@ -2351,7 +2454,7 @@ mod tests {
     #[test]
     fn count_image_markers_ignores_stale_tool_results() {
         let messages = vec![
-            ChatMessage::tool("[IMAGE:/tmp/stale-tool.png]\nGenerated".to_string()),
+            ChatMessage::tool("<tool_result name=\"image_gen\">[IMAGE:/tmp/stale-tool.png]\nGenerated</tool_result>".to_string()),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
@@ -2363,10 +2466,133 @@ mod tests {
 
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+            ChatMessage::tool("<tool_result name=\"image_gen\">[IMAGE:/tmp/latest-tool.png]\nGenerated</tool_result>".to_string()),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    fn write_png(path: &std::path::Path) {
+        std::fs::write(path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+    }
+
+    fn assistant_tool_call(id: &str, name: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!({
+                "content": "",
+                "tool_calls": [{"id": id, "name": name, "arguments": "{}"}]
+            })
+            .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_leaves_markers_from_text_tools_as_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("existing.png");
+        write_png(&image_path);
+
+        let tool_content = serde_json::json!({
+            "tool_call_id": "call_search",
+            "content": format!("docs/guide.md:3:reply with [IMAGE:{}]", image_path.display()),
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("Find the docs".to_string()),
+            assistant_tool_call("call_search", "content_search"),
+            ChatMessage::tool(tool_content.clone()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_images);
+        assert_eq!(
+            prepared.messages[2].content, tool_content,
+            "a text tool's result must reach the provider exactly as the tool printed it"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_resolves_image_tool_by_call_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("generated.png");
+        write_png(&image_path);
+
+        let messages = vec![
+            ChatMessage::user("Draw a cat".to_string()),
+            assistant_tool_call("call_gen", "image_gen"),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_gen",
+                    "content": format!("saved [IMAGE:{}]", image_path.display()),
+                })
+                .to_string(),
+            ),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content).unwrap();
+        let inner = value["content"].as_str().unwrap();
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(!inner.contains("generated.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_leaves_mixed_prompt_tool_results_as_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("generated.png");
+        write_png(&image_path);
+
+        let content = format!(
+            "[Tool results]\n<tool_result name=\"image_gen\">saved [IMAGE:{0}]</tool_result>\n<tool_result name=\"file_read\">see [IMAGE:{0}]</tool_result>",
+            image_path.display()
+        );
+        let messages = vec![ChatMessage::user(content.clone())];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages[0].content, content);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_older_text_tool_results_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("existing.png");
+        write_png(&image_path);
+
+        let tool_content = serde_json::json!({
+            "tool_call_id": "call_read",
+            "content": format!("notes: [IMAGE:{}]", image_path.display()),
+        })
+        .to_string();
+        let messages = vec![
+            assistant_tool_call("call_read", "file_read"),
+            ChatMessage::tool(tool_content.clone()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Read it.".to_string(),
+            },
+            ChatMessage::user("Thanks".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared.messages[1].content, tool_content,
+            "an older text tool result is not stripped, so history stays byte-stable"
+        );
     }
 
     #[test]
@@ -2539,7 +2765,7 @@ mod tests {
     fn trim_old_images_counts_latest_tool_messages() {
         let messages = vec![
             ChatMessage::user("[IMAGE:/tmp/user-old.png]\nOldest".to_string()),
-            ChatMessage::tool("[IMAGE:/tmp/tool-new.png]\nGenerated".to_string()),
+            ChatMessage::tool("<tool_result name=\"image_gen\">[IMAGE:/tmp/tool-new.png]\nGenerated</tool_result>".to_string()),
         ];
 
         let trimmed = trim_old_images(&messages, 1);
