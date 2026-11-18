@@ -499,7 +499,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": function_call_output_value(output, value.get("attachments")),
                         }));
                     } else if !msg.content.trim().is_empty() {
                         input.push(legacy_tool_output_message(&msg.content));
@@ -519,6 +519,37 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
     };
 
     (instructions, input)
+}
+
+/// Image attachments of a tool result go out as `input_image` items next to
+/// the text, as the Codex client sends them; without this the provider drops
+/// them and the model never sees the image. Only loaded targets (`data:`
+/// URIs, `http(s)` URLs) can be sent; other attachments stay out.
+fn function_call_output_value(output: &str, attachments: Option<&Value>) -> Value {
+    let images: Vec<String> = zeroclaw_api::tool_carrier::native_attachments(attachments)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|attachment| attachment.kind == zeroclaw_api::media::MarkerKind::Image)
+        .map(|attachment| attachment.target)
+        .filter(|target| {
+            target.starts_with("data:")
+                || target.starts_with("https://")
+                || target.starts_with("http://")
+        })
+        .collect();
+    if images.is_empty() {
+        return Value::String(output.to_string());
+    }
+    let mut items = Vec::with_capacity(images.len() + 1);
+    if !output.trim().is_empty() {
+        items.push(serde_json::json!({"type": "input_text", "text": output}));
+    }
+    items.extend(
+        images
+            .into_iter()
+            .map(|image_url| serde_json::json!({"type": "input_image", "image_url": image_url})),
+    );
+    Value::Array(items)
 }
 
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
@@ -2962,6 +2993,47 @@ data: [DONE]
         assert_eq!(result.tool_calls[0].id, "call_1");
         assert_eq!(result.tool_calls[0].name, "shell");
         assert_eq!(result.tool_calls[0].arguments, "{\"command\":\"pwd\"}");
+    }
+
+    #[test]
+    fn tool_result_image_attachment_becomes_input_image_item() {
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_gen",
+                "content": "saved",
+                "attachments": [{"kind": "image", "target": "data:image/png;base64,iVBORw0KGgo="}],
+            })
+            .to_string(),
+        )];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_gen");
+        assert_eq!(
+            input[0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "saved"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_result_marker_text_and_unloaded_attachments_stay_a_string() {
+        let quoted = "docs/guide.md:3:reply with [IMAGE:data:image/png;base64,AAAA]";
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_search",
+                "content": quoted,
+                "attachments": [{"kind": "image", "target": "/workspace/images/a.png"}],
+            })
+            .to_string(),
+        )];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input[0]["output"], quoted);
     }
 
     #[test]
